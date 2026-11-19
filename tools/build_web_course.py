@@ -16,6 +16,7 @@ import base64
 import html
 import json
 import re
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +51,31 @@ def read_code_pair(filename: str):
     )
 
 
+def load_guides(chapters):
+    guides = json.loads((ROOT / "web/lesson_guides.json").read_text(encoding="utf-8"))
+    if guides.keys() != {ch["id"] for ch in chapters}:
+        raise ValueError("章节目录与导读目录不一致")
+    for ch in chapters:
+        guide = guides[ch["id"]]
+        path, marker, count, symbol, note = guide["source"]
+        lines = (ROOT / "minimind" / path).read_text(encoding="utf-8").splitlines()
+        matches = [i for i, line in enumerate(lines) if line.lstrip().startswith(marker)]
+        if len(matches) != 1 or matches[0] + count > len(lines):
+            raise ValueError(f'{ch["id"]} 源码摘录无法定位到 {path} 中的 {marker!r}')
+        start = matches[0]
+        guide["source"] = {
+            "path": path, "start": start + 1, "end": start + count, "symbol": symbol, "note": note,
+            "code": textwrap.dedent("\n".join(lines[start:start + count])),
+        }
+        for target, _ in guide["uses"]:
+            if target not in guides and not (ROOT / "minimind" / target).is_file():
+                raise ValueError(f'{ch["id"]} 的应用入口不存在: {target}')
+        activity = guide["practice"][0]
+        if activity != "vis" and f"TODO({activity})" not in ch["todos"]:
+            raise ValueError(f'{ch["id"]} 的练习入口不存在: {activity}')
+        ch["guide"] = guide
+
+
 def build_chapters_data():
     chapters = [
         # ===================================================================== 0. 底层基石
@@ -65,33 +91,30 @@ def build_chapters_data():
             "visualizer": "fp_roofline",
             "todos": ["TODO(ch01-1)", "TODO(ch02-1)", "TODO(ch02-2)"],
             "theory_html": T(r"""
-<h4>1. PyTorch Tensor 的物理内存布局：为什么 <code>transpose</code> 后直接 <code>view</code> 会报错？</h4>
-<p>在物理内存（RAM 或 GPU 显存）中，<strong>所有多维张量都是一维连续字节数组（<code>Storage</code>）</strong>。一个形状为 $(B, L, H, D)$ 的四维张量之所以能按坐标索引，全靠 Tensor 头部维护的<strong>步幅元组 $\text{stride} = (s_0, s_1, s_2, s_3)$</strong>：</p>
-$$\text{storage\_index}(i_0, i_1, i_2, i_3) = \text{offset} + i_0 s_0 + i_1 s_1 + i_2 s_2 + i_3 s_3$$
+<h4>1. 步幅决定怎样读一块内存</h4>
+<p>把六个数排成两行 <code>[[0, 1, 2], [3, 4, 5]]</code>。沿行走一步要跨过 3 个数，沿列走一步只跨 1 个数，步幅就是 <code>(3, 1)</code>。转置后，第一行读成 <code>[0, 3]</code>，步幅换成 <code>(1, 3)</code>，底层六个数仍按原顺序存放。</p>
+$$\text{storage\_index}(i_0,i_1,i_2,i_3)=\text{offset}+\sum_{k=0}^3 i_k s_k$$
+<p><strong>用在注意力的哪里？</strong> 第 5 章把张量从「批次、序列、头、特征」转成「批次、头、序列、特征」，让每个头分别算注意力。转置往往只改步幅。若新的维度无法按原步幅合并，<code>view</code> 会报错；<code>reshape</code> 可以在需要时复制。<code>repeat_kv</code> 中的 <code>expand</code> 通过零步幅共享数据，之后的 <code>reshape</code> 仍可能分配内存。</p>
+
+<h4>2. 浮点精度决定哪些中间结果存得下</h4>
+<p>在二进制正规浮点数里，符号位决定正负，指数决定数量级，尾数决定这一数量级里能区分多细的差异。</p>
+$$x=(-1)^S 2^{E-\mathrm{bias}}\left(1+\sum_{k=1}^{M}b_k2^{-k}\right)$$
 <ul>
-  <li><strong>行优先连续（Contiguous）</strong>：新创建的张量满足 $s_k = \prod_{j > k} \text{shape}_j$，最后一维步幅恒为 $s_3 = 1$。此时调用 <code>.view()</code> 只是修改 <code>shape</code> 和 <code>stride</code> 元数据，<strong>耗时 $O(1)$ 且零显存拷贝</strong>。</li>
-  <li><strong><code>.transpose(1, 2)</code> 的本质</strong>：在注意力层中，我们把 $(B, L, H, D)$ 转置为 $(B, H, L, D)$。PyTorch <strong>不会搬动物理内存里的任何一个浮点数</strong>，仅仅交换了 <code>shape</code> 和 <code>stride</code> 的第 1、2 维！此时物理内存顺序与逻辑顺序不一致（<code>is_contiguous() == False</code>），若紧接着调 <code>.view(B, L, -1)</code> 就会报错，必须先调 <code>.contiguous()</code>（或 <code>.reshape()</code>）在显存中重排。</li>
-  <li><strong><code>.expand()</code> 的零拷贝广播魔术</strong>：在 MiniMind 的 <code>repeat_kv</code> 中，把形状 $(B, L, H_{kv}, 1, D)$ 扩展为 $(B, L, H_{kv}, n_{\text{rep}}, D)$ 时，PyTorch 直接把第 3 维的步幅设为 <strong>$s_3 = 0$</strong>——无论下标取几，偏移量都加 0，多个 Query 头在物理上读取同一份 KV 内存！</li>
+  <li><strong>FP16</strong> 用 5 位指数和 10 位尾数，最大有限值为 65,504。平方后的数可能上溢，反向传播中的小梯度也可能被舍入到零。</li>
+  <li><strong>BF16</strong> 用 8 位指数和 7 位尾数，有接近 FP32 的取值范围，相邻可表示数之间的间隔更大。</li>
+  <li><strong>用在归一化与训练</strong> 第 4 章的 RMSNorm 用 FP32（8 位指数、23 位尾数）计算平方均值，再恢复输入精度。第 12 章的 FP16 训练还会放大损失，在更新参数前还原梯度尺度。</li>
 </ul>
 
-<h4>2. IEEE-754 浮点数位级拆解：为什么 FP16 动不动溢出 <code>NaN</code>，而 BF16 稳如泰山？</h4>
-<p>任何二进制浮点数都表示为：</p>
-$$x = (-1)^S \times 2^{E - \text{bias}} \times \left(1 + \sum_{k=1}^{M} b_k 2^{-k}\right)$$
-<ul>
-  <li><strong>FP32（1 符号 + 8 指数 + 23 尾数，bias=127）</strong>：动态范围 $1.18 \times 10^{-38} \sim 3.40 \times 10^{38}$，约 7 位十进制有效数字。</li>
-  <li><strong>FP16（1 符号 + <span style="color:var(--destructive)">5 指数</span> + 10 尾数，bias=15）</strong>：指数只有 5 位！<strong>最大可表示正数仅为 $65504$</strong>，最小正正规数 $6.10 \times 10^{-5}$（算上非正规数为 $5.96 \times 10^{-8}$）。
-    <br>👉 <strong>灾难现场 1（前向上溢）</strong>：在 <code>RMSNorm</code> 中需要算 $x^2$，只要激活值 $|x| > \sqrt{65504} = 255.94$，FP16 下 $x^2$ 瞬间变成 <code>inf</code>，后续全部变成 <code>NaN</code>！
-    <br>👉 <strong>灾难现场 2（反向梯度下溢）</strong>：反向传播时学习率与多级小导数连乘，大量梯度落在 $10^{-8} \sim 10^{-5}$ 区间，在 FP16 下直接下溢变成 <code>0</code>！因此 FP16 <strong>必须搭配 <code>GradScaler</code></strong>：反向传播前把 Loss 乘以放大倍数 $S = 2^{16}$，把梯度整体抬进可表示区间，<code>optimizer.step()</code> 前再除以 $S$。</li>
-  <li><strong>BF16（1 符号 + <span style="color:var(--success)">8 指数</span> + 7 尾数，bias=127）</strong>：直接截取 FP32 的前 16 位！<strong>拥有与 FP32 完全相同的 $10^{\pm 38}$ 动态范围</strong>，彻底解决上溢和梯度下溢问题，无需 <code>GradScaler</code>；唯一代价是尾数只有 7 位（约 2.4 位十进制精度），所以在做百维累加规约（如 <code>RMSNorm</code> 求平方均值、<code>Attention</code> 点积与 Softmax）时，MiniMind 全部先用 <code>.float()</code> 升到 FP32 计算，算完再 <code>.type_as(x)</code> 转回 BF16！</li>
-</ul>
+<h4>3. 用带宽估算一次解码要等多久</h4>
+<p>线性层把输入向量乘以权重矩阵。权重从显存读进来以后，同一批中的多个 token 可以复用它。一次只处理一个 token 时，同样一批权重只贡献一行输出。用「运算次数除以读写字节数」可以估算哪项资源先到上限。</p>
+$$\mathcal I=\frac{\mathrm{FLOPs}}{\mathrm{Bytes}},\qquad \mathcal I_{\mathrm{ridge}}=\frac{P_{\mathrm{peak}}}{\mathrm{BW}}$$
+<p>例如以 312 TFLOP/s 和 1.5 TB/s 作估算，拐点约为 208 FLOP/byte。若主要流量来自 BF16 权重，一次读 2 字节并做一次乘加（2 FLOP），单 token、单样本时约为 1 FLOP/byte。实际耗时还取决于缓存、批量和算子实现。</p>
+<p><strong>用在生成的哪里？</strong> 第 10 章先一次读完整段提示（prefill），再逐词解码（decode）。第 5 章的 KV 缓存省去重算历史键值的工作，GQA 还减少需要保存和读取的键值头数。</p>
 
-<h4>3. GPU 存储层次与 Roofline 性能模型：为什么推理慢在「搬数据」而不是「算乘法」？</h4>
-<p>现代 GPU（如 A100）的 Tensor Core 算力高达 $P_{\text{peak}} = 312\text{ TFLOPS}$，但片外显存（HBM）带宽只有 $\text{BW}_{\text{HBM}} \approx 1.5\text{ TB/s}$，而片上缓存（SRAM，仅 20~40MB）带宽高达 $19\text{ TB/s}$。定义算子的<strong>算术强度（Arithmetic Intensity）</strong>为每搬运 1 字节显存所能执行的浮点运算数：</p>
-$$\mathcal{I} = \frac{\text{FLOPs}}{\text{Bytes}_{\text{HBM}}}, \qquad \mathcal{I}_{\text{ridge}} = \frac{P_{\text{peak}}}{\text{BW}_{\text{HBM}}} \approx \frac{312 \times 10^{12}}{1.5 \times 10^{12}} \approx 208\text{ FLOPs/Byte}$$
-<ul>
-  <li><strong>训练与 Prefill 阶段（输入完整序列 $L = 512$）</strong>：线性层是矩阵乘矩阵 $[BL, d] \times [d, d]$，运算量 $2BLd^2$，访存量约 $2d^2$ 字节（BF16），算术强度 $\mathcal{I} \approx BL \gg 208$，属于 <strong>Compute-Bound（算力受限）</strong>。</li>
-  <li><strong>自回归 Decode 阶段（已缓存历史 KV，每次只输入 $L = 1$ 个新 token）</strong>：矩阵乘退化为<strong>向量乘矩阵</strong> $[1, d] \times [d, d]$，每从显存搬运 1 个 2 字节权重只做 2 次运算，算术强度 <strong>$\mathcal{I} \approx 1\text{ FLOP/Byte} \ll 208$</strong>！此时 GPU 99% 的时间都在等待从 HBM 搬运模型权重和历史 KV Cache——属于极端的 <strong>Memory-Bandwidth-Bound（显存带宽受限）</strong>！这正是 MiniMind 引入 <strong>KV Cache、GQA（砍半 KV 搬运量）、FlashAttention（SRAM 分块避免读写 $L\times L$ 矩阵）</strong> 的根本硬件原因。</li>
-</ul>
+<h4>4. Autograd 怎样把一次预测变成一次权重更新？</h4>
+<p>让一个标量参数 $w=2$ 乘以输入 $x=3$，目标是 5。预测为 6，平方损失为 1。反向传播沿「平方 → 相减 → 相乘」走回来，把每一步的局部导数相乘。</p>
+$$L=(wx-5)^2,\qquad \frac{\partial L}{\partial w}=2(wx-5)x=6$$
+<p>以学习率 0.01 更新一次，$w$ 变成 1.94，预测变成 5.82，误差缩小。<strong>去第 12 章</strong>对照 <code>loss.backward()</code> 与 <code>optimizer.step()</code> 的分工。去第 9 章再看 <code>detach()</code>，它让某一条计算路径在反向时停止传递梯度。</p>
 """),
             "papers": [
                 {
@@ -1081,7 +1104,7 @@ $$R(\tau) = \operatorname{clip}\!\left( R_{\text{format}} + R_{\text{tool\_align
                 }
             ],
             "code_walkthrough": [
-                ("trainer/train_agent.py:L148-L153", "env_ids = tokenizer(next_Turn_Prompt_Piece, add_special_tokens=False).input_ids\nif len(env_ids) > 0:\n    all_resp_ids.extend(env_ids)\n    all_masks.extend([0] * len(env_ids))\n    all_old_logps.extend([0.0] * len(env_ids))", "多轮 Agent Rollout 的灵魂：模型自己生成的 token 掩码设为 1，而外部工具返回的 <tool_response> 片段掩码设为 0，绝不把环境输出算进策略梯度。"),
+                ("trainer/train_agent.py:L121-L123", "response_ids.extend(new_ids)\nresponse_mask.extend([int(t != tokenizer.eos_token_id) for t in new_ids])\nresponse_old_logps.extend(new_logps)", "和上方的工具观察对比，这里缓存模型生成的 token 及其旧策略对数概率。非 EOS 的生成位置参与策略更新。"),
                 ("trainer/trainer_utils.py:L184-L186", "def pow_guard(base, exp):\n    if abs(exp) > 1e4 or (abs(base) > 1 and abs(exp) * math.log10(abs(base)) > 100): raise ValueError('幂运算结果过大')\n    return base ** exp", "AST 安全求值沙箱：拦截 9**9**9 等超大指数运算，防止模型在 RL 探索中生成算力炸弹把训练进程卡死。")
             ],
             "hints": [
@@ -1096,6 +1119,7 @@ $$R(\tau) = \operatorname{clip}\!\left( R_{\text{format}} + R_{\text{tool\_align
         ch["lab_code"] = lab_code
         ch["ref_code"] = ref_code
 
+    load_guides(chapters)
     return chapters
 
 
@@ -1212,16 +1236,6 @@ def build_html():
   background: var(--code-background);
   color: var(--foreground);
 }
-.mobile-jump-bar {
-  display: flex;
-  gap: 6px;
-  margin-top: 10px;
-}
-@media (min-width: 980px) {
-  .mobile-jump-bar {
-    display: none;
-  }
-}
 * { box-sizing: border-box; }
 html, body {
   margin: 0;
@@ -1332,17 +1346,6 @@ html, body {
 }
 .ch-btn.active .ch-dot {
   background: var(--primary-foreground);
-}
-.workspace-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 12px;
-}
-@media (min-width: 980px) {
-  .workspace-grid {
-    grid-template-columns: 1.08fr 0.92fr;
-    align-items: start;
-  }
 }
 .tab-bar {
   display: flex;
@@ -1518,7 +1521,6 @@ html, body {
 }
 .code-editor {
   width: 100%;
-  height: 195px;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.55;
@@ -1527,7 +1529,7 @@ html, body {
   border: 1px solid var(--border);
   border-radius: calc(var(--radius) - 2px);
   padding: 12px;
-  resize: vertical;
+  resize: none;
   tab-size: 4;
 }
 .code-editor:focus {
@@ -1662,30 +1664,28 @@ html, body {
   opacity: 0.7;
 }
 </style>
+<style>__WORKSPACE_CSS__</style>
 </head>
 <body>
 <div class="app-root">
   <!-- 顶部导航与状态栏 -->
-  <div class="box">
+  <header class="box course-header">
     <div class="topbar">
-      <div>
-        <div class="brand-title">
-          <span>🧭 Learn-MiniMind 交互式底层原理 · 论文精读 · LeetCode 闯关平台</span>
-        </div>
-        <div class="brand-sub">无需打开 VS Code：在浏览器内一站式完成「底层系统与数学推导 → 22 篇顶会论文 → 动态可视化实验 → 在线写代码评测」</div>
-      </div>
+      <h1 class="brand-title">Learn-MiniMind <small>从零手写语言模型</small></h1>
       <div class="status-row">
-        <span id="latex-status-pill" class="pill pill-success">∑ LaTeX 公式引擎自检中...</span>
-        <span id="backend-status-pill" class="pill" style="cursor:pointer;" onclick="checkBackend(true)" title="点击尝试连接本地 python tools/web_ide.py PyTorch 后端">⚡ 浏览器内置评测引擎</span>
-        <span id="progress-pill" class="pill pill-accent">🏆 闯关进度: 0 / 18</span>
-        <button class="btn" onclick="toggleSyncDrawer()" title="在电脑、iPad、手机多设备间同步学习进度与代码">☁️ 多端同步</button>
-        <button class="btn" onclick="toggleTheme()" id="theme-toggle-btn" title="切换亮色/暗色阅读主题">🌓 主题</button>
+        <span id="progress-pill" class="pill pill-accent"></span>
+        <button class="btn" onclick="toggleSyncDrawer()" aria-controls="sync-drawer">多端同步</button>
+        <button class="btn" onclick="toggleTheme()" id="theme-toggle-btn">切换主题</button>
       </div>
     </div>
-    <div style="margin-top: 12px;" class="chapter-Strip" id="chapter-nav"></div>
-    <div class="mobile-jump-bar">
-      <button class="btn" style="flex:1; justify-content:center;" onclick="document.getElementById('pane-learn').scrollIntoView({behavior:'smooth'})">📖 跳至教材与公式</button>
-      <button class="btn btn-primary" style="flex:1; justify-content:center;" onclick="document.getElementById('pane-code').scrollIntoView({behavior:'smooth'})">💻 跳至代码编辑器</button>
+    <div class="course-controls">
+      <nav aria-label="课程章节" class="chapter-Strip" id="chapter-nav"></nav>
+      <label class="chapter-picker">章节 <select id="chapter-select" onchange="openLesson(this.value)"></select></label>
+      <div class="view-switch" aria-label="工作区布局" role="group">
+        <button data-view="learn" onclick="setView('learn')">教材</button>
+        <button data-view="split" onclick="setView('split')">分栏</button>
+        <button data-view="code" onclick="setView('code')">代码</button>
+      </div>
     </div>
 
     <!-- 多设备端同步中心抽屉 -->
@@ -1730,58 +1730,70 @@ html, body {
         </div>
       </div>
     </div>
-  </div>
+  </header>
 
-  <!-- 主工作区：左教程/论文/可视化 + 右 LeetCode 编译器 -->
-  <div class="workspace-grid">
-    <!-- 左栏：知识、论文、可视化、源码对照 -->
-    <div class="box" id="pane-learn">
-      <div id="ch-meta-bar" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px;"></div>
-      <h2 class="ch-header-title" id="ch-title"></h2>
-      <p class="ch-header-sub" id="ch-subtitle"></p>
-
-      <div class="tab-bar">
-        <button class="tab-btn active" onclick="switchTab('theory')" id="tab-btn-theory">🧠 底层原理与数学推导</button>
-        <button class="tab-btn" onclick="switchTab('papers')" id="tab-btn-papers">📜 核心论文精读</button>
-        <button class="tab-btn" onclick="switchTab('vis')" id="tab-btn-vis">🎛️ 交互式可视化实验室</button>
-        <button class="tab-btn" onclick="switchTab('walk')" id="tab-btn-walk">🔍 MiniMind 源码逐行对照</button>
+  <main class="workspace-grid" id="workspace" data-desktop-view="split" data-mobile-view="learn">
+    <section class="box study-pane" id="pane-learn" aria-labelledby="ch-title">
+      <div class="lesson-heading">
+        <div id="ch-meta-bar"></div>
+        <h2 class="ch-header-title" id="ch-title"></h2>
       </div>
+      <nav class="tab-bar" aria-label="本章学习内容">
+        <button class="tab-btn active" onclick="switchTab('theory')" id="tab-btn-theory">导读与原理</button>
+        <button class="tab-btn" onclick="switchTab('vis')" id="tab-btn-vis">可视化实验</button>
+        <button class="tab-btn" onclick="switchTab('walk')" id="tab-btn-walk">源码对照</button>
+        <button class="tab-btn" onclick="switchTab('papers')" id="tab-btn-papers">论文精读</button>
+      </nav>
 
-      <div id="tab-content-theory" class="theory-body"></div>
-      <div id="tab-content-papers" style="display:none;"></div>
-      <div id="tab-content-vis" style="display:none;"></div>
-      <div id="tab-content-walk" style="display:none;"></div>
-    </div>
+      <div class="lesson-scroll" id="lesson-scroll" tabindex="0" aria-label="本章教材">
+        <div id="tab-content-theory">
+          <div id="lesson-guide"></div>
+          <h3 class="derivation-title">原理与推导 <span id="latex-status-pill" class="pill pill-success">公式自检中</span></h3>
+          <div class="theory-body" id="theory-text"></div>
+        </div>
+        <div id="tab-content-papers" hidden></div>
+        <div id="tab-content-vis" hidden></div>
+        <div id="tab-content-walk" hidden></div>
+      </div>
+    </section>
 
-    <!-- 右栏：LeetCode 在线代码编辑器与评测控制台 -->
-    <div class="box" id="pane-code">
+    <div class="split-handle width-handle" id="width-handle" role="separator" tabindex="0"
+         aria-orientation="vertical" aria-controls="pane-learn" aria-label="教材宽度"
+         aria-valuemin="30" aria-valuemax="70" aria-valuenow="54"
+         title="左右拖动调整分栏；方向键微调，双击恢复默认"></div>
+
+    <section class="box study-pane" id="pane-code" aria-labelledby="ide-file-title">
       <div class="ide-toolbar">
-        <div>
-          <div style="font-size:14px; font-weight:700;" id="ide-file-title">💻 在线编程练习</div>
-          <div style="font-size:11.5px; color:var(--muted-foreground);" id="ide-mm-ref"></div>
-        </div>
-        <div style="display:flex; flex-wrap:wrap; gap:6px;">
-          <button class="btn" onclick="toggleHint()">💡 提示</button>
-          <button class="btn" onclick="resetCurrentCode()">🔄 重置</button>
-          <button class="btn" onclick="fillSolution()">✨ 填入参考答案</button>
-          <button class="btn btn-success" onclick="submitAndGrade()">🏆 运行并提交评测</button>
+        <h2 id="ide-file-title">代码练习</h2>
+        <div class="grade-actions">
+          <button id="backend-status-pill" class="pill" onclick="checkBackend(true)" title="连接本地 PyTorch 评测服务">浏览器规则检查</button>
+          <button class="btn btn-primary" onclick="submitAndGrade()">运行评测</button>
         </div>
       </div>
-
-      <div class="todo-chips" id="todo-chips-bar"></div>
-      <div id="hint-drawer" style="display:none; margin-bottom:10px; padding:10px 12px; background:var(--warning-surface); border:1px solid var(--warning); border-radius:6px; font-size:12.5px;"></div>
-
-      <textarea id="code-editor" class="code-editor" spellcheck="false"></textarea>
-
-      <div class="console-box" id="grade-console">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:12.5px; font-weight:700;">🧪 测试用例与 MiniMind 数值对齐控制台</span>
-          <span style="font-size:11.5px; color:var(--muted-foreground);" id="console-status-text">点击右上角「🏆 运行并提交评测」检验你的代码</span>
+      <div class="exercise-tools">
+        <div class="todo-chips" id="todo-chips-bar" aria-label="定位练习"></div>
+        <div class="editor-actions">
+          <button class="btn" onclick="toggleHint()" aria-controls="hint-drawer">提示</button>
+          <button class="btn" onclick="fillSolution()">填入参考答案</button>
+          <button class="btn" onclick="resetCurrentCode()">重置代码</button>
         </div>
-        <div id="testcase-results"></div>
       </div>
-    </div>
-  </div>
+      <div id="hint-drawer" hidden></div>
+      <div class="editor-stack" id="editor-stack">
+        <textarea id="code-editor" class="code-editor" wrap="off" aria-label="Python 练习代码" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+        <div class="split-handle height-handle" id="height-handle" role="separator" tabindex="0"
+             aria-orientation="horizontal" aria-controls="code-editor" aria-label="代码编辑区高度"
+             aria-valuemin="40" aria-valuemax="100" aria-valuenow="100"
+             title="上下拖动调整编辑器与评测区；方向键微调，双击恢复默认"></div>
+        <section class="console-box" id="grade-console">
+          <button class="console-toggle" id="console-toggle" aria-expanded="false" aria-controls="testcase-results" onclick="toggleConsole()">
+            <strong>评测结果</strong><span id="console-status-text" aria-live="polite">待运行</span><span class="disclosure" aria-hidden="true">⌃</span>
+          </button>
+          <div id="testcase-results" tabindex="0" hidden></div>
+        </section>
+      </div>
+    </section>
+  </main>
 </div>
 
 <script>__KATEX_JS__</script>
@@ -1793,6 +1805,10 @@ let backendAvailable = false;
 let backendUrl = 'http://127.0.0.1:8765';
 const userCodeStore = {};
 const solvedStore = {};
+let displayedChapterId = null;
+let gradeRequest = 0;
+
+__WORKSPACE_JS__
 
 // ==================== 1. LaTeX 零故障渲染与严格自检 ====================
 function renderAllMath(container) {
@@ -1837,7 +1853,8 @@ function verifyAllChaptersLatex() {
   });
   const pill = document.getElementById('latex-status-pill');
   if (totalErrors === 0) {
-    pill.textContent = `∑ LaTeX 公式自检通过 (${totalFormulas} 个公式 0 错误)`;
+    pill.textContent = `公式 ✓ ${totalFormulas}`;
+    pill.title = `${totalFormulas} 个公式渲染通过，0 个错误`;
     pill.className = 'pill pill-success';
   } else {
     pill.textContent = `⚠️ LaTeX 公式发现 ${totalErrors} 个错误`;
@@ -1846,7 +1863,7 @@ function verifyAllChaptersLatex() {
 
 // ==================== 2. 检测本地 PyTorch 评测后端 ====================
 async function checkBackend(manual) {
-  if (!manual && window.location.port !== 8765) return;
+  if (!manual && window.location.port !== '8765') return;
   try {
     const res = await fetch(backendUrl + '/api/health', { method: 'GET' });
     if (res.ok) {
@@ -1864,41 +1881,42 @@ async function checkBackend(manual) {
 // ==================== 3. 章节导航与标签页切换 ====================
 function renderChapterNav() {
   const nav = document.getElementById('chapter-nav');
-  nav.innerHTML = '';
+  const picker = document.getElementById('chapter-select');
+  nav.replaceChildren();
+  picker.replaceChildren();
   CHAPTERS.forEach((ch, idx) => {
+    const active = idx === currentChapterIdx;
+    const solved = !!solvedStore[ch.id];
     const btn = document.createElement('button');
-    const isSolved = !!solvedStore[ch.id];
-    btn.className = 'ch-btn' + (idx === currentChapterIdx ? ' active' : '') + (isSolved ? ' solved' : '');
-    btn.innerHTML = `<span class="ch-dot"></span><span>${ch.id.toUpperCase()}</span>`;
+    btn.className = 'ch-btn' + (active ? ' active' : '') + (solved ? ' solved' : '');
+    btn.innerHTML = `<span class="ch-key">${chapterNumber(ch)}</span> ${escapeHtml(ch.guide.nav)}`;
     btn.title = ch.title;
-    btn.onclick = () => selectChapter(idx);
+    if (active) btn.setAttribute('aria-current', 'step');
+    btn.onclick = () => openLesson(ch.id);
     nav.appendChild(btn);
+    picker.add(new Option(chapterNumber(ch) + ' · ' + ch.guide.nav + (solved ? ' ✓' : ''), ch.id));
   });
-  const solvedCount = Object.keys(solvedStore).filter(k => solvedStore[k]).length;
-  document.getElementById('progress-pill').textContent = `🏆 闯关进度: ${solvedCount} / ${CHAPTERS.length}`;
+  picker.value = CHAPTERS[currentChapterIdx].id;
+  const solvedCount = CHAPTERS.filter(ch => solvedStore[ch.id]).length;
+  document.getElementById('progress-pill').textContent = `进度 ${solvedCount} / ${CHAPTERS.length}`;
 }
 
-function selectChapter(idx) {
-  // 保存当前编辑器代码
-  const curCh = CHAPTERS[currentChapterIdx];
+function selectChapter(idx, captureDraft = true) {
   const editor = document.getElementById('code-editor');
-  if (curCh && editor.value) {
-    userCodeStore[curCh.id] = editor.value;
-  }
+  if (captureDraft && displayedChapterId) userCodeStore[displayedChapterId] = editor.value;
   currentChapterIdx = idx;
   const ch = CHAPTERS[idx];
+  displayedChapterId = ch.id;
+  gradeRequest++;
 
-  document.getElementById('ch-meta-bar').innerHTML = `
-    <span class="pill pill-accent">${ch.stage}</span>
-    <span class="pill">${ch.badge}</span>
-    <span class="pill">难度: ${ch.difficulty}</span>
-    <span class="pill">练习文件: labs/${ch.file}</span>
-  `;
-  document.getElementById('ch-title').textContent = ch.title;
-  document.getElementById('ch-subtitle').textContent = ch.subtitle;
+  document.getElementById('ch-meta-bar').textContent = ch.stage + '　/　第 ' + chapterNumber(ch) + ' 章';
+  const heading = document.getElementById('ch-title');
+  heading.textContent = ch.guide.topic;
+  heading.title = ch.title;
+  renderGuide(ch);
 
   // 1) 渲染理论与公式
-  const theoryEl = document.getElementById('tab-content-theory');
+  const theoryEl = document.getElementById('theory-text');
   theoryEl.innerHTML = ch.theory_html;
   renderAllMath(theoryEl);
 
@@ -1918,34 +1936,49 @@ function selectChapter(idx) {
 
   // 3) 渲染交互式可视化实验室
   renderVisualizer(ch.visualizer);
+  if (ch.guide.practice[0] === 'vis') {
+    const instruction = document.createElement('p');
+    instruction.className = 'guide-task';
+    instruction.textContent = ch.guide.practice[1];
+    document.getElementById('tab-content-vis').prepend(instruction);
+  }
 
   // 4) 渲染源码逐行对照
   const walkEl = document.getElementById('tab-content-walk');
-  walkEl.innerHTML = ch.code_walkthrough.map(([loc, snippet, desc]) => `
+  walkEl.innerHTML = renderSourceExcerpt(ch.guide.source) + ch.code_walkthrough.map(([loc, snippet, desc]) => `
     <div class="code-walk-card">
       <div class="code-walk-loc">📍 ${loc}</div>
       <div class="code-walk-pre">${escapeHtml(snippet)}</div>
-      <div class="code-walk-desc">💡 <strong>底层解析：</strong>${desc}</div>
+      <div class="code-walk-desc">💡 <strong>底层解析：</strong>${escapeHtml(desc)}</div>
     </div>
   `).join('');
 
   // 5) 渲染右侧 IDE
-  document.getElementById('ide-file-title').textContent = `💻 labs/${ch.file} (${ch.todos.length} 个待实现关卡)`;
-  document.getElementById('ide-mm-ref').textContent = `对照 MiniMind 原版: ${ch.mm_path}`;
-  editor.value = userCodeStore[ch.id] !== undefined ? userCodeStore[ch.id] : ch.lab_code;
-  document.getElementById('hint-drawer').style.display = 'none';
-  document.getElementById('hint-drawer').innerHTML = ch.hints.map(h => `<div style="margin:4px 0;">• ${escapeHtml(h)}</div>`).join('');
-
+  document.getElementById('ide-file-title').textContent = 'labs/' + ch.file;
+  editor.value = userCodeStore[ch.id] ?? ch.lab_code;
+  editor.setSelectionRange(0, 0);
+  editor.scrollTop = editor.scrollLeft = 0;
+  document.getElementById('hint-drawer').hidden = true;
+  document.querySelector('[aria-controls="hint-drawer"]').setAttribute('aria-expanded', false);
+  document.getElementById('hint-drawer').innerHTML = ch.hints.map(h => `<div>• ${escapeHtml(h)}</div>`).join('');
+  document.getElementById('console-status-text').textContent = '待运行';
+  document.getElementById('testcase-results').textContent = '完成本章练习后点「运行评测」查看结果。';
   updateTodoChips();
   renderChapterNav();
+  switchTab('theory');
+  saveLocalState();
 }
 
 function switchTab(tabName) {
   currentTab = tabName;
   ['theory', 'papers', 'vis', 'walk'].forEach(t => {
-    document.getElementById('tab-content-' + t).style.display = (t === tabName) ? 'block' : 'none';
-    document.getElementById('tab-btn-' + t).className = 'tab-btn' + (t === tabName ? ' active' : '');
+    const active = t === tabName;
+    document.getElementById('tab-content-' + t).hidden = !active;
+    const button = document.getElementById('tab-btn-' + t);
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active);
   });
+  document.getElementById('lesson-scroll').scrollTop = 0;
 }
 
 function escapeHtml(s) {
@@ -1961,22 +1994,37 @@ function updateTodoChips() {
     const tag = todo.match(/ch\\d+-\\d+/)[0];
     const notImplRe = new RegExp(`raise\\\\s+NotImplementedError\\\\(["']${tag}`);
     const isDone = !notImplRe.test(code);
-    return `<span class="todo-chip ${isDone ? 'done' : ''}" onclick="jumpToTodo('${todo}')">${isDone ? '✅' : '📝'} ${todo}</span>`;
+    return `<button class="todo-chip ${isDone ? 'done' : ''}" title="定位到 ${todo}" onclick="jumpToTodo('${todo}')">${isDone ? '✓ ' : ''}${tag}</button>`;
   }).join('');
 }
 
 function jumpToTodo(todo) {
   const editor = document.getElementById('code-editor');
-  const idx = editor.value.indexOf(todo);
+  const ch = CHAPTERS[currentChapterIdx];
+  let needle = todo;
+  let idx = editor.value.indexOf(todo);
+  // A learner may have deleted the TODO comment. Locate its original function instead.
+  if (idx < 0) {
+    const prefix = ch.lab_code.slice(0, ch.lab_code.indexOf(todo));
+    const defs = [...prefix.matchAll(/^ *def (\\w+)\\(/gm)];
+    if (defs.length) {
+      needle = 'def ' + defs[defs.length - 1][1] + '(';
+      idx = editor.value.indexOf(needle);
+    }
+  }
+  editor.focus({ preventScroll: true });
   if (idx >= 0) {
-    editor.focus();
-    editor.setSelectionRange(idx, idx + todo.length);
+    editor.setSelectionRange(idx, idx + needle.length);
+    const line = editor.value.slice(0, idx).split('\\n').length - 1;
+    editor.scrollTop = Math.max(0, line * parseFloat(getComputedStyle(editor).lineHeight) - editor.clientHeight / 3);
+    editor.scrollLeft = 0;
   }
 }
 
 function toggleHint() {
-  const d = document.getElementById('hint-drawer');
-  d.style.display = d.style.display === 'none' ? 'block' : 'none';
+  const drawer = document.getElementById('hint-drawer');
+  drawer.hidden = !drawer.hidden;
+  document.querySelector('[aria-controls="hint-drawer"]').setAttribute('aria-expanded', !drawer.hidden);
 }
 
 function resetCurrentCode() {
@@ -1984,6 +2032,7 @@ function resetCurrentCode() {
   document.getElementById('code-editor').value = ch.lab_code;
   userCodeStore[ch.id] = ch.lab_code;
   updateTodoChips();
+  saveLocalState();
 }
 
 function fillSolution() {
@@ -1995,6 +2044,7 @@ function fillSolution() {
   document.getElementById('code-editor').value = cleanRef;
   userCodeStore[ch.id] = cleanRef;
   updateTodoChips();
+  saveLocalState();
 }
 
 // 内置浏览器端规则与数学等价检验器（支持无后端即开即用评测）
@@ -2055,7 +2105,10 @@ async function submitAndGrade() {
 
   const statusText = document.getElementById('console-status-text');
   const resultsEl = document.getElementById('testcase-results');
-  statusText.textContent = '⏳ 正在执行评测...';
+  const request = ++gradeRequest;
+  if (editorShare > 94) setEditorShare(Math.min(lastOpenShare, 78));
+  resultsEl.textContent = '';
+  statusText.textContent = '正在评测…';
 
   // 若本地 PyTorch 后端在线，优先发往真实 PyTorch 内核执行 pytest
   if (backendAvailable) {
@@ -2066,16 +2119,13 @@ async function submitAndGrade() {
         body: JSON.stringify({ chapterId: ch.id === 'ch00' ? 'ch01-02' : ch.id, code })
       });
       const data = await res.json();
+      if (request !== gradeRequest) return;
       if (data.ok && data.passed) {
         solvedStore[ch.id] = true;
+        saveLocalState();
         renderChapterNav();
         statusText.textContent = `✅ PyTorch 真机评测通过 (${data.elapsed_ms} ms)`;
-        resultsEl.innerHTML = `
-          <div class="testcase-card testcase-pass"><strong>✅ 测试用例 1：张量形状与 API 契约检查</strong> — PASSED</div>
-          <div class="testcase-card testcase-pass"><strong>✅ 测试用例 2：与 MiniMind 原版模块逐元素数值对齐 (atol=1e-5)</strong> — PASSED</div>
-          <div class="testcase-card testcase-pass"><strong>✅ 测试用例 3：Autograd 反向传播梯度一致性校验</strong> — PASSED</div>
-          <pre style="margin-top:8px; font-size:11.5px; color:var(--success); white-space:pre-wrap;">${escapeHtml(data.output)}</pre>
-        `;
+        resultsEl.innerHTML = `<pre class="code-walk-pre">${escapeHtml(data.output)}</pre>`;
         return;
       } else if (data.ok) {
         statusText.textContent = `❌ PyTorch 评测未通过 (${data.elapsed_ms} ms)`;
@@ -2090,7 +2140,8 @@ async function submitAndGrade() {
     }
   }
 
-  // 浏览器内置 AST 与数学规则评测引擎（免启动服务器即开即用）
+  // 静态网页只检查待实现标记和必需的代码模式。
+  if (request !== gradeRequest) return;
   const caseCards = [];
   let allPass = true;
   ch.todos.forEach((todo, i) => {
@@ -2098,7 +2149,7 @@ async function submitAndGrade() {
     const notImplRe = new RegExp(`raise\\\\s+NotImplementedError\\\\(["']${tag}`);
     if (notImplRe.test(code)) {
       allPass = false;
-      caseCards.push(`<div class="testcase-card testcase-fail"><strong>📝 关卡 ${i + 1} (${todo})：尚未实现</strong><br>代码中仍包含 <code>raise NotImplementedError("${tag}...")</code>，请替换为你自己的实现（或点击上方「💡 提示」/「✨ 填入参考答案」）。</div>`);
+      caseCards.push(`<div class="testcase-card testcase-fail"><strong>📝 关卡 ${i + 1} (${todo})：尚未实现</strong><br>代码中仍包含 <code>raise NotImplementedError("${tag}...")</code>，请替换为你自己的实现（或点击上方「提示」或「填入参考答案」）。</div>`);
       return;
     }
     const rule = BROWSER_RULES[todo];
@@ -2110,15 +2161,15 @@ async function submitAndGrade() {
         return;
       }
     }
-    caseCards.push(`<div class="testcase-card testcase-pass"><strong>✅ 关卡 ${i + 1} (${todo})：算子结构、广播维度与 MiniMind 等价性校验通过！</strong></div>`);
+    caseCards.push(`<div class="testcase-card testcase-pass"><strong>✅ 关卡 ${i + 1} (${todo})：已找到练习所需的代码模式。</strong></div>`);
   });
 
   if (allPass) {
     solvedStore[ch.id] = true;
     saveLocalState();
     renderChapterNav();
-    statusText.textContent = '🎉 全部测试用例通过！(Accepted)';
-    caseCards.push(`<div class="testcase-card testcase-pass" style="margin-top:8px;"><strong>🏆 本章通关！</strong> 前向输出与反向梯度均对齐 <code>${ch.mm_path}</code>。</div>`);
+    statusText.textContent = '浏览器规则检查通过';
+    caseCards.push(`<div class="testcase-card testcase-pass" style="margin-top:8px;"><strong>本章代码结构检查通过。</strong> 在本地运行 PyTorch 评测可进一步验证数值结果。</div>`);
   } else {
     statusText.textContent = '⚠️ 部分关卡待完成或未通过检查';
   }
@@ -2131,13 +2182,18 @@ document.addEventListener('DOMContentLoaded', () => {
     saveLocalState();
   });
   document.getElementById('code-editor').addEventListener('keydown', function(e) {
-    if (e.key === 'Tab') {
+    if (e.key === 'Escape') {
+      heightHandle.focus();
+      return;
+    }
+    if (e.key === 'Tab' && !e.shiftKey) {
       e.preventDefault();
       const start = this.selectionStart;
       const end = this.selectionEnd;
       this.value = this.value.substring(0, start) + '    ' + this.value.substring(end);
       this.selectionStart = this.selectionEnd = start + 4;
       updateTodoChips();
+      saveLocalState();
     }
   });
 });
@@ -2371,17 +2427,17 @@ function updateFpRoofline() {
   const xSq = x * x;
   const fp16Overflow = xSq > 65504;
   const intensity = (B * L).toFixed(1);
-  const boundType = (B * L < 200) ? 'Memory-Bandwidth-Bound (受限于显存带宽)' : 'Compute-Bound (算力满载)';
+  const boundType = (B * L < 208) ? '带宽可能先达到上限' : '算力可能先达到上限';
 
   document.getElementById('v-fp-metrics').innerHTML = `
     <div class="metric-card"><div class="metric-label">x² 真实数值</div><div class="metric-val">${xSq.toLocaleString()}</div></div>
-    <div class="metric-card"><div class="metric-label">FP16 直接算 x² (上限 65504)</div><div class="metric-val" style="color:${fp16Overflow ? 'var(--destructive)' : 'var(--success)'}">${fp16Overflow ? 'Infinity → NaN 💥' : xSq}</div></div>
-    <div class="metric-card"><div class="metric-label">BF16 / MiniMind .float()</div><div class="metric-val" style="color:var(--success)">${xSq.toLocaleString()} } ✅</div></div>
+    <div class="metric-card"><div class="metric-label">FP16 直接算 x² (上限 65504)</div><div class="metric-val" style="color:${fp16Overflow ? 'var(--destructive)' : 'var(--success)'}">${fp16Overflow ? '+∞（上溢）' : xSq}</div></div>
+    <div class="metric-card"><div class="metric-label">MiniMind 用 FP32 平方</div><div class="metric-val" style="color:var(--success)">${xSq.toLocaleString()}</div></div>
     <div class="metric-card"><div class="metric-label">线性层算术强度 (FLOPs/Byte)</div><div class="metric-val">≈ ${intensity}</div></div>
   `;
   document.getElementById('v-fp-explain').innerHTML = `
-    <strong>当前硬件瓶颈诊断：</strong> <strong>${boundType}</strong>。
-    ${L === 1 ? '在自回归 Decode (L=1) 阶段，每从显存搬运 1 个权重参数只做 B 次乘加，算术强度远低于 GPU 拐点 (~200 FLOPs/Byte)，因此使用 KV Cache 和 GQA 减少显存搬运量是提速关键！' : '在 Prefill / 训练阶段 (B×L=' + (B*L) + ')，权重矩阵从 HBM 读入 SRAM 后被 B×L 个 token 高度复用，Tensor Core 算力得到充分发挥。'}
+    按每个 BF16 权重读一次、忽略激活读写的估算，每字节约完成 ${intensity} 次浮点运算。
+    与示例设备约 208 FLOP/byte 的拐点相比，${boundType}。
   `;
 }
 
@@ -2609,30 +2665,26 @@ function updateMaskVis(mode) {
   ['pt', 'sft', 'ag'].forEach(k => document.getElementById('btn-mv-' + k).className = 'btn');
   document.getElementById(mode === 'pretrain' ? 'btn-mv-pt' : (mode === 'sft' ? 'btn-mv-sft' : 'btn-mv-ag')).className = 'btn btn-primary';
 
-  let items = [];
-  if (mode === 'pretrain') {
+  let items;
+  if (mode === 'pretrain' || mode === 'sft') {
+    // Compare the supervision on exactly the same tokenized text. The first token has no predecessor.
     items = [
-      ['<|im_start|>', false], ['Transformer', true], ['通过', true], ['自注意力', true], ['建模', true], ['上下文', true], ['。<|im_end|>', true], ['<|pad|>', false], ['<|pad|>', false]
+      ['<|im_start|>', false], ['user\\n', false], ['1+1 等于几？', false], ['<|im_end|>\\n', false],
+      ['<|im_start|>assistant\\n', false], ['等于 2。', true], ['<|im_end|>\\n', true], ['<|pad|>', false]
     ];
-  } else if (mode === 'sft') {
-    items = [
-      ['<|im_start|>user\\n', false], ['你是谁？', false], ['<|im_end|>\\n', false],
-      ['<|im_start|>assistant\\n', false], ['<think>\\n\\n</think>\\n\\n', true], ['我是MiniMind助手。', true], ['<|im_end|>\\n', true],
-      ['<|im_start|>user\\n', false], ['1+1等于几？', false], ['<|im_end|>\\n', false],
-      ['<|im_start|>assistant\\n', false], ['等于2。', true], ['<|im_end|>\\n', true], ['<|pad|>', false]
-    ];
+    if (mode === 'pretrain') items = items.map(([text], i) => [text, i > 0 && i < items.length - 1]);
   } else {
     items = [
       ['<|im_start|>user\\n算 256*37<|im_end|>\\n', false],
       ['<|im_start|>assistant\\n', false],
-      ['<tool_call>{"name":"calculate_math","arguments":{"expression":"256*37"}</tool_call><|im_end|>\\n', true],
-      ['<|im_start|>user\\n<tool_response>{"result":"9472"}</tool_response><|im_end|>\\n', false],
+      ['<tool_call>{"name":"calculate_math","arguments":{"expression":"256*37"}}</tool_call>\\n', true],
+      ['<|im_end|>\\n<|im_start|>user\\n<tool_response>{"result":"9472"}</tool_response><|im_end|>\\n', false],
       ['<|im_start|>assistant\\n', false],
-      ['计算结果是 9472。<|im_end|>\\n', true]
+      ['计算结果是 9472。', true], ['<|im_end|>', false]
     ];
   }
   document.getElementById('v-mv-tokens').innerHTML = `
-    <div style="font-size:12px; margin-bottom:8px;"><span style="color:var(--success)">■ 绿色 (label = token_id / mask = 1)：参与计算 Loss 与反向传播梯度</span> ｜ <span style="color:var(--muted-foreground)">■ 灰色 (label = -100 / mask = 0)：不产生梯度</span></div>
+    <div style="font-size:12px; margin-bottom:8px;"><span style="color:var(--success)">■ 绿色 · 计入该位置的训练目标</span> ｜ <span style="color:var(--muted-foreground)">■ 灰色 · 跳过该位置的直接损失</span></div>
     <div>${items.map(([txt, active]) => `<span class="token-badge ${active ? 'token-active' : 'token-masked'}">${escapeHtml(txt)}</span>`).join('')}</div>
   `;
 }
@@ -2708,13 +2760,13 @@ function saveLocalState() {
   try {
     const curCh = CHAPTERS[currentChapterIdx];
     const editor = document.getElementById('code-editor');
-    if (curCh && editor && editor.value) {
+    if (displayedChapterId && curCh && editor) {
       userCodeStore[curCh.id] = editor.value;
     }
     // 仅存储与初始 lab_code 不同的自定义代码，大幅减小存储体积
     const customCode = {};
     CHAPTERS.forEach(ch => {
-      if (userCodeStore[ch.id] && userCodeStore[ch.id] !== ch.lab_code) {
+      if (typeof userCodeStore[ch.id] === 'string' && userCodeStore[ch.id] !== ch.lab_code) {
         customCode[ch.id] = userCodeStore[ch.id];
       }
     });
@@ -2732,19 +2784,19 @@ function saveLocalState() {
 
 function applyStateSnapshot(snap, silent) {
   if (!snap || typeof snap !== 'object') return false;
-  if (snap.theme) {
+  if (displayedChapterId) userCodeStore[displayedChapterId] = document.getElementById('code-editor').value;
+  if (snap.theme === 'dark' || snap.theme === 'light') {
     document.documentElement.setAttribute('data-theme', snap.theme);
   }
   if (snap.solved && typeof snap.solved === 'object') {
     Object.keys(snap.solved).forEach(k => { solvedStore[k] = !!snap.solved[k]; });
   }
   if (snap.code && typeof snap.code === 'object') {
-    Object.keys(snap.code).forEach(k => { userCodeStore[k] = snap.code[k]; });
+    CHAPTERS.forEach(({ id }) => { if (typeof snap.code[id] === 'string') userCodeStore[id] = snap.code[id]; });
   }
-  const targetIdx = (typeof snap.chapterIdx === 'number' && snap.chapterIdx >= 0 && snap.chapterIdx < CHAPTERS.length)
+  const targetIdx = (Number.isInteger(snap.chapterIdx) && snap.chapterIdx >= 0 && snap.chapterIdx < CHAPTERS.length)
     ? snap.chapterIdx : currentChapterIdx;
-  selectChapter(targetIdx);
-  saveLocalState();
+  selectChapter(targetIdx, false);
   if (!silent) {
     setSyncStatus(`✅ 已成功恢复进度（已通关 ${Object.keys(solvedStore).filter(k => solvedStore[k]).length} 章，快照时间: ${snap.ts ? snap.ts.slice(0, 19).replace('T', ' ') : '刚刚'}）`);
   }
@@ -2797,7 +2849,7 @@ function buildSyncSnapshot(includeFullCode) {
   const customCode = {};
   if (includeFullCode) {
     CHAPTERS.forEach(ch => {
-      if (userCodeStore[ch.id] && userCodeStore[ch.id] !== ch.lab_code) {
+      if (typeof userCodeStore[ch.id] === 'string' && userCodeStore[ch.id] !== ch.lab_code) {
         customCode[ch.id] = userCodeStore[ch.id];
       }
     });
@@ -2944,9 +2996,10 @@ async function pullFromGist() {
 
 // 初始化
 window.addEventListener('load', () => {
-  verifyAllChaptersLatex();
-  selectChapter(0);
+  initWorkspace();
   loadLocalState();
+  if (!displayedChapterId) selectChapter(0);
+  setTimeout(verifyAllChaptersLatex, 0);
   checkBackend();
 });
 </script>
@@ -2955,6 +3008,8 @@ window.addEventListener('load', () => {
 """
     out_path = ROOT / "index.html"
     html_doc = html_doc.replace("__KATEX_CSS__", katex_css).replace("__KATEX_JS__", katex_js).replace("__CHAPTERS_JSON__", chapters_json)
+    for marker, filename in [("__WORKSPACE_CSS__", "workspace.css"), ("__WORKSPACE_JS__", "workspace.js")]:
+        html_doc = html_doc.replace(marker, (ROOT / "web" / filename).read_text(encoding="utf-8"))
     out_path.write_text(html_doc, encoding="utf-8")
     print(f"已生成交互式网页课程与在线编程平台: {out_path} ({len(html_doc) / 1024:.1f} KB)")
 

@@ -9,7 +9,7 @@
 MiniMind 用不到 3000 行原生 PyTorch 代码完整实现了从分词器、Qwen3 风格 Dense/MoE 架构、Pretrain、Full SFT、LoRA、白盒知识蒸馏，到 DPO、PPO、GRPO/CISPO、多轮 Tool-Use Agentic RL 的全套流程。但对于初学者来说，直接扎进 22 个脚本里很容易迷失在分布式训练、混合精度、数据掩码和强化学习公式中。
 
 **本项目将 MiniMind 拆解为「6 大阶段、20 个递进章节、46 个动手编程关卡（TODOs）、15 套自动化对齐测试」**：
-- 📖 **每一章先讲透底层原理与数学公式**，再带你**逐行精读 `minimind/` 对应源码与行号**；
+- 📖 每章从一个具体问题开始。先跟着小例子算一遍，在「学完会用在哪里？」里找到会复用它的章节，再打开实验、定位练习或对照真实的 MiniMind 源码。
 - 🧩 **剥离工程噪音的模块化参考实现 `tinymind/`**：与 `MiniMindForCausalLM` **100% 权重兼容、逐元素数值等价**；
 - ✍️ **闯关式填空练习 `labs/` + 自动评测器 `tools/grade.py`**：亲手写完核心代码，运行测试立刻验证你的实现是否与 MiniMind 原版完全一致；
 - ⚡ **30 秒纯 CPU 全流程微缩实验 `tools/train_tiny_pipeline.py`**：无需 GPU、无需下载数 GB 数据，在本地 30 秒内跑通 `Pretrain -> SFT -> LoRA -> 蒸馏 -> DPO -> GRPO/Agent` 六大阶段！
@@ -36,7 +36,7 @@ learn-minimind/
 ├── tests/                         # 🧪 15 套自动化单元测试（检验形状、梯度以及与 MiniMind 原版的逐元素等价性）
 ├── tools/
 │   ├── web_ide.py                 # 🖥️ 启动网页端 LeetCode 实时 PyTorch 评测服务（http://127.0.0.1:8765）
-│   ├── build_web_course.py        # 🏗️ 生成并校验自包含交互式网页 index.html（含 510 个 LaTeX 公式零错误自检）
+│   ├── build_web_course.py        # 🏗️ 生成自包含交互式网页，校验导读的源码与练习入口，并在浏览器里检查公式渲染
 │   ├── grade.py                   # 🏆 命令行闯关评测器（按章节检查 labs/ 进度）
 │   ├── train_tiny_pipeline.py     # ⚡ 30 秒 CPU 全流程微缩训练实验（一次跑通 6 大训练阶段）
 │   └── make_labs.py               # 🔧 从 tinymind/ 自动生成 labs/ 练习骨架
@@ -46,6 +46,8 @@ learn-minimind/
 ---
 
 ## 🚀 3 分钟快速上手
+
+打开在线课程后，先在第 0 章算一遍 300 的平方，再点「打开本章实验」比较 FP16 和 FP32。桌面可拖动两栏中间的分隔条分配阅读空间，拖动代码下方的横条调整评测区。选中分隔条后也可用方向键微调，双击或按 Enter 恢复默认。手机在页面顶部切换「教材」和「代码」。
 
 ### 1. 运行 30 秒全流程微缩实验（直观感受 LLM 训练全生命周期）
 
